@@ -1,24 +1,19 @@
 /* lfvutil.c */
-/* Martynas Ceicys */
-/* Copyright notice at end of file */
+/* Copyright notice is at the end of this file */
 
-#include <lua.h>
-#include <lauxlib.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "lfv.h"
 
-#define FALSE 0
-#define TRUE 1
-
-static int		forceExpansion = FALSE;
-static char*	outputFilePath = 0;
+static const char* inputFilePath = 0;
+static int forceExpansion = 0;
 
 /*--------------------------------------
 	ReadOption
 --------------------------------------*/
-int ReadOption(char* vals[], int num, int* consume)
+static int ReadOption(char* vals[], int num, int* consume)
 {
 	*consume = 0;
 
@@ -28,32 +23,34 @@ int ReadOption(char* vals[], int num, int* consume)
 		return 1;
 	}
 
-	if(!strcmp(vals[0], "/o"))
+	if(!strcmp(vals[0], "/?"))
 	{
-		size_t len;
+		printf(
+"LUA_FAKE_VECTOR [/?] [/i inputFile] [/f]\n"
+"\n"
+"If inputFile is not given, reads from stdin.\n"
+"\n"
+"If /f is set, vector expansion is forced even if the script does not begin \n"
+"with 'LFV_EXPAND_VECTORS()'.\n"
+		);
 
+		exit(0);
+		*consume = 1;
+	}
+	else if(!strcmp(vals[0], "/i"))
+	{
 		if(num < 2)
 		{
-			printf("Expected outputFile after '/o'\n");
+			printf("Expected inputFile after '/i'\n");
 			return 1;
 		}
 
-		len = strlen(vals[1]);
-
-		if(!len)
-		{
-			printf("outputFile strlen is 0\n");
-			return 1;
-		}
-
-		outputFilePath = (char*)malloc(len + 1);
-		strncpy(outputFilePath, vals[1], len);
-		outputFilePath[len] = 0;
+		inputFilePath = vals[1];
 		*consume = 2;
 	}
 	else if(!strcmp(vals[0], "/f"))
 	{
-		forceExpansion = TRUE;
+		forceExpansion = 1;
 		*consume = 1;
 	}
 	else
@@ -66,122 +63,41 @@ int ReadOption(char* vals[], int num, int* consume)
 }
 
 /*--------------------------------------
-	StrRPBrk
---------------------------------------*/
-const char* StrRPBrk(const char* str, const char* breakSet)
-{
-	const char* br = breakSet;
-	const char* last = 0;
-
-	while(*br != '\0')
-	{
-		const char* ch = strrchr(str, *br);
-
-		if(ch && (!last || ch > last))
-			last = ch;
-
-		br++;
-	}
-
-	return last;
-}
-
-/*--------------------------------------
-	ExtensionDot
---------------------------------------*/
-const char* ExtensionDot(const char* str)
-{
-	const char* ext = strrchr(str, '.');
-	const char* slash = StrRPBrk(str, "/\\");
-
-	if(ext && slash && slash - str > ext - str)
-		ext = 0;
-
-	return ext;
-}
-
-/*--------------------------------------
 	main
 --------------------------------------*/
 int main(int argc, char* argv[])
 {
-	int i, err;
-	const char* inputFilePath;
-	lua_State* l;
+	int i, errOpt;
+	char* result;
+	const char* errExp;
+	unsigned errLine;
 
-	if(argc < 2)
-	{
-		printf(
-"LFVUTIL inputFile [/o outputFile] [/f]"
-"\n\n"
-"If outputFile is not given, it is set to inputFile with '_expanded' appended\n"
-"to the filename."
-"\n\n"
-"If /f is set, vector expansion is forced even if the file does not begin with\n"
-"'LFV_EXPAND_VECTORS()'."
-"\n"
-		);
-
-		return 0;
-	}
-
-	inputFilePath = argv[1];
-
-	for(i = 2; i < argc;)
+	for(i = 1; i < argc;)
 	{
 		int consume;
 
-		if(err = ReadOption(argv + i, argc - i, &consume))
-			return err;
+		if(errOpt = ReadOption(argv + i, argc - i, &consume))
+			return errOpt;
 
 		i += consume;
 	}
 
-	if(!outputFilePath)
-	{
-		const size_t APPEND_LEN = 9;
-		size_t inLen = strlen(inputFilePath);
-		size_t outLen = inLen + APPEND_LEN;
-		const char* ext = ExtensionDot(inputFilePath);
-		size_t append = ext ? ext - inputFilePath : inLen;
-		outputFilePath = (char*)malloc(outLen + 1);
-		strncpy(outputFilePath, inputFilePath, append);
-		strncpy(outputFilePath + append, "_expanded", APPEND_LEN);
-		strncpy(outputFilePath + append + APPEND_LEN, inputFilePath + append, inLen - append);
-		outputFilePath[outLen] = 0;
-	}
+	result = lfvExpandFile(inputFilePath, forceExpansion, 0, &errExp, &errLine);
 
-	if(!strcmp(inputFilePath, outputFilePath))
+	if(errExp)
 	{
-		printf("inputFile and outputFile should not be equal\n");
+		printf("Expansion error ln %u: %s\n", errLine, errExp);
+		lfvFreeBuffer(result);
 		return 1;
 	}
 
-	l = luaL_newstate();
-	lfvSetDebugPath(outputFilePath, TRUE, TRUE, FALSE);
-	err = lfvLoadFile(l, inputFilePath, forceExpansion);
-
-	if(err)
-		printf("%s\n", lua_tostring(l, -1));
-
-	if(lfvError())
-		printf("expansion error ln %u: %s\n", lfvErrorLine(), lfvError());
-
-	printf("Expanded '%s' to '%s'\n", inputFilePath, outputFilePath);
-	lua_pop(l, 1);
-	lua_close(l);
-
-	if(outputFilePath)
-	{
-		free(outputFilePath);
-		outputFilePath = 0;
-	}
-
+	printf("%s", result);
+	lfvFreeBuffer(result);
 	return 0;
 }
 
 /*
-Copyright (C) 2023 Martynas Ceicys
+Copyright (C) 2025 Martynas Ceicys
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software
 and associated documentation files (the “Software”), to deal in the Software without
