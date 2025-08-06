@@ -1,0 +1,19 @@
+LIBRARY lfv
+EXPORTS
+ lfvExpandFile
+ lfvExpandString
+ lfvFreeBuffer
+ lfvReader
+ lfvInitReaderState
+ lfvTermReaderState
+ lfvTruncatedName
+ lfvResolveName
+ lfvLoadTextFile
+ lfvLoadString
+ luaopen_lfv
+ lfvCLuaLoadTextFile
+ lfvCLuaLoadString
+ lfvCLuaExpandFile
+ lfvCLuaExpandString
+ lfvCLuaEnsureSearcher
+ lfvCLuaSearcher

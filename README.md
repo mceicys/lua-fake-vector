@@ -1,9 +1,18 @@
 # Lua Fake Vector
 
 * [Intro](#intro)
-* [Setup](#setup)
+* [Build](#build)
+	* [Build on Windows with CMake](#build-on-windows-with-cmake)
+	* [Build on Linux with make](#build-on-linux-with-make)
+	* [Build Manually](#build-manually)
+* [Usage](#usage)
+	* [Using LFV in Lua](#using-lfv-in-lua)
+	* [Using LFV in C](#using-lfv-in-c)
+	* [Using lfvutil](#using-lfvutil)
 * [Benchmark](#benchmark)
 * [Limitations](#limitations)
+* [Todo](#todo)
+* [Reference](#reference)
 
 ## Intro
 
@@ -50,17 +59,88 @@ v3 =>  x,  y,  z
 q4 => qx, qy, qz, qw
 ```
 
-## Setup
+For a script to be expanded, its first statement must be `LFV_EXPAND_VECTORS()`, otherwise the preprocessor leaves the script unmodified. The preprocessor can be forced to expand scripts via a parameter. Note that this statement is erased by the preprocessor; Lua won't execute it unless the script is compiled without being preprocessed.
 
-LFV is primarily tested with Lua 5.3 but should be compatible with Lua 5.1 thru 5.4.
+## Build
 
-Include `lfv.h` and compile `lfv.c` to get the functions `lfvExpandFile` and `lfvExpandString` which take a file path or a string and return the expanded result on success. Free the returned buffer with `lfvFreeBuffer`.
+LFV is compatible with Lua 5.1 thru 5.4. You can build it to get:
+* lfv: C module dll/so that can be loaded by Lua via `require`
+* lfvutil: Command-line utility that reads from a file or stdin and outputs the expanded version
 
-For a file to be expanded, its first statement must be `LFV_EXPAND_VECTORS()`, otherwise the preprocessor leaves the script unmodified. Comments before this statement are OK. The preprocessor can be forced to expand scripts without this statement by passing `1` to the `forceExpand` parameter. Note that this statement is erased by the preprocessor; Lua won't execute it unless the script is compiled without being preprocessed.
+### Build on Windows with CMake
 
-Optionally, you may also include `lfvlua.h` and compile `lfvlua.c` to get the functions `lfvLoadFile` and `lfvLoadString`, which mimic [`luaL_loadfile`](https://www.lua.org/manual/5.3/manual.html#luaL_loadfile) and [`luaL_loadstring`](https://www.lua.org/manual/5.3/manual.html#luaL_loadstring). `lfvlua` requires the Lua source and includes its headers with brackets, like this: `#include <lua.h>`
+You can build LFV on Windows with CMake 3.22 or higher. After opening a terminal in LFV's directory:
 
-You can also compile `lfvutil.c` (with `lfv.c`) to get a cmd utility that reads from a file or stdin and outputs the expanded version. Parameters are `[/?] [/i inputFile] [/f]`. `/?` displays the help text. `/f` forces expansion.
+```cmd
+mkdir build
+cd build
+cmake .. -DLUA_DIR="C:/path/to/lua" -DLUA_VERSION="5.4" -DCMAKE_INSTALL_PREFIX="./install"
+cmake --build . --config Release
+cmake --install .
+```
+
+You will find `lfv.dll` in `./install/lib/lua/5.4` and `lfvutil.exe` in `./install/bin`.
+
+### Build on Linux with make
+
+If you have Lua 5.4 installed on your Linux system, you can `cd` to the LFV directory and do:
+
+```bash
+sudo make install
+```
+
+This builds and installs `lfv.so` in `/usr/local/lib/lua/5.4` and `lfvutil` in `/usr/local/bin`. You can uninstall with:
+
+```bash
+sudo make uninstall
+```
+
+If you have a different Lua version installed, you can set `LUA_VERSION` to the major.minor version.  
+You can set `LUA_DIR` to a preferred directory when searching for Lua's headers.
+
+### Build Manually
+
+```
+lfv:
+	Windows: lfv.c, lfvlua.c, lfv.def, lua.lib (import library)
+	Linux: lfv.c, lfvlua.c
+lfvutil:
+	lfvutil.c, lfv.c
+```
+
+## Usage
+
+### Using LFV in Lua
+
+To load the dynamic library and enable expansion on subsequent `require` calls do:
+
+```lua
+lfv = require("lfv").EnsureSearcher()
+```
+
+Quick test:
+
+```lua
+lfv.LoadString("v3Test = 1, 2, 3; print(1 - v3Test)", true)()
+-- Should print 0 -1 -2
+```
+
+See the [Reference](#reference) for a description of all the functions.
+
+### Using LFV in C
+
+LFV also has a C API if you want to use the library from C.
+
+Include `lfv.h` to get the functions `lfvExpandFile` and `lfvExpandString` which take a file path or a string and return the expanded result on success. Free the returned buffer with `lfvFreeBuffer`.
+
+Include `lfvlua.h` to get the functions `lfvLoadTextFile` and `lfvLoadString` which mimic [`luaL_loadfile`](https://www.lua.org/manual/5.4/manual.html#luaL_loadfile) and [`luaL_loadstring`](https://www.lua.org/manual/5.4/manual.html#luaL_loadstring). This header also contains the prototypes of C Lua functions registered by `luaopen_lfv`.
+
+### Using lfvutil
+
+`lfvutil` reads from a file or stdin and outputs the expanded version. Parameters are `[-h] [-i inputFile] [-f]`.  
+`-h` displays the help text.  
+`-i` sets an input file path.  
+`-f` forces expansion.
 
 ## Benchmark
 
@@ -195,11 +275,11 @@ end
 
 ## Limitations
 
-Vectors are not objects. LFV just provides a shortcut for referring to multiple variables.
+:: Vectors are not objects. LFV just provides a shortcut for referring to multiple variables.
 
-Since vectors are not objects, vectors are copied by value, not by reference.
+:: Since vectors are not objects, vectors are copied by value, not by reference.
 
-Since vectors are not singular objects, functions will typically return a vector as an expression list. An expression calling such a function cannot immediately operate on the returned vector because Lua will truncate the list to a single component. Instead, the returned vector has to be stored temporarily:
+:: Since vectors are not singular objects, functions will typically return a vector as an expression list. An expression calling such a function cannot immediately operate on the returned vector because Lua will truncate the list to a single component. Instead, the returned vector has to be stored temporarily:
 
 ```lua
 function Normalized2(x, y)
@@ -215,7 +295,7 @@ v2A = v2A * nNewMag
 v2A = Normalized2(v2A) * nNewMag
 ```
 
-Since vector expressions are duplicated, table accesses and function calls in those expressions are repeated. It's better to first save the results in local variables and use those in the vector expression instead:
+:: Since vector expressions are duplicated, table accesses and function calls in those expressions are repeated. It's better to first save the results in local variables and use those in the vector expression instead:
 
 ```lua
 -- Expensive; Mag3 is called 3 times
@@ -225,3 +305,52 @@ v3A = v3A * Mag3(v3B)   -- xA, yA, zA = xA * Mag3(xB, yB, zB), yA * Mag3(xB, yB,
 local nMagB = Mag3(v3B) -- local nMagB = Mag3(xB, yB, zB)
 v3A = v3A * nMagB       -- xA, yA, zA = xA * nMagB, yA * nMagB, zA * nMagB
 ```
+
+:: Since a whole vector is stored under multiple names generated at preprocessing time, accessing the vector via a dynamic name string requires runtime string manipulation and a static awareness that multiple keys must be accessed to get the whole vector. LFV is inefficient in this case and currently provides no helper functions to deal with it.
+
+## Todo
+
+* Allow `LFV_EXPAND_VECTORS()` to appear later in the script
+* Have `lfv.Searcher` log all expansions to `lfv.sLogPath`
+* Return error if different size prefixes show up in a vector expression: `v3A + v2B` is probably not intended
+* Return error if not all duplicated components are defined: `v3A = 1, 2` is probably not intended
+	* We especially want to catch stuff like: `v2A = Normalized2(v2A) * nNewMag`
+* Functions to help with runtime name resolution (string -> component strings, table + string -> multiple fields, etc.)
+
+## Reference
+
+### lfv.LoadTextFile (sFilePath [, bForceExpand] [, sLogPath])
+_= CompiledChunk | (nil, sError)_
+
+Loads the text file at `sFilePath` with vector expansion and returns the chunk as a function. If expansion or loading fail, **nil** is returned followed by an error message. Precompiled files are detected and return an error.
+
+If `bForceExpand` is **true**, `LFV_EXPAND_VECTORS()` is not required at the start of the script for expansion to work.
+
+Expansion output and errors are appended to the file located at `sLogPath` if it can be opened/created.
+
+### lfv.LoadString (sChunk [, bForceExpand] [, sLogPath])
+_= CompiledChunk | (nil, sError)_
+
+Like [`lfv.LoadTextFile`](#lfvloadtextfile-sfilepath--bforceexpand--slogpath) but takes the script as a string instead of loading it from a file.
+
+### lfv.ExpandFile (sFilePath [, bForceExpand] [, sLogPath])
+_= sExpanded | (nil, sError)_
+
+Like [`lfv.LoadTextFile`](#lfvloadtextfile-sfilepath--bforceexpand--slogpath) but returns the expanded script as a string instead of compiling it.
+
+### lfv.ExpandString(sChunk [, bForceExpand] [, sLogPath]);
+_= sExpanded | (nil, sError)_
+
+Like [`lfv.ExpandFile`](#lfvexpandfile-sfilepath--bforceexpand--slogpath) but takes the script as a string instead of loading it from a file.
+
+### lfv.EnsureSearcher()
+_= lfv_
+
+Inserts [`lfv.Searcher`](#lfvsearchersmodulename) as the second element in [`package.searchers`](https://www.lua.org/manual/5.4/manual.html#pdf-package.searchers) if it doesn't already exist in the array. Typically that's after [`package.preload`](https://www.lua.org/manual/5.4/manual.html#pdf-package.preload) and before the .lua searcher.
+
+The `lfv` module is returned so setup can be done in one statement: `lfv = require("lfv").EnsureSearcher()`
+
+### lfv.Searcher(sModuleName)
+_= (Loader, sModulePath) | [sFailReason]_
+
+This function can be inserted into [`package.searchers`](https://www.lua.org/manual/5.4/manual.html#pdf-package.searchers) before the standard .lua file searcher to enable vector expansion on `require`'d scripts.

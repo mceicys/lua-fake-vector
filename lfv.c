@@ -4,6 +4,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +17,8 @@
 #define FALSE 0
 #define TRUE 1
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define RETURN_ERROR(str) return SetReaderError(s, str, line)
+#define SYNTAX_ERR(str) (SetReaderError(s, str, line, LFV_ERR_SYNTAX), EXPAND_ERR)
+#define RUNTIME_ERR(str) (SetReaderError(s, str, line, LFV_ERR_RUNTIME), EXPAND_ERR)
 #define IDENTIFIER_CHARS "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 #define NUMERAL_CHARS    "0123456789ABCDEFPXabcdefpx+-."
 #define WHITESPACE_CHARS " \t\n\f\r"
@@ -24,6 +26,7 @@
 #define LOG_PREFIX "-- LFV: "
 #define STRINGIFY(x) STRINGIFY_(x)
 #define STRINGIFY_(x) #x
+#define BINARY_SIGNATURE "\x1bLua"
 
 enum
 {
@@ -43,7 +46,7 @@ typedef struct delayed_duplication_s {
 } delayed_duplication;
 
 static char*		ReaderNoSetJmp(void* dataIO, size_t* sizeOut);
-static int			SetReaderError(lfv_reader_state* sIO, const char* str, unsigned line);
+static void			SetReaderError(lfv_reader_state* sIO, const char* str, unsigned line, int code);
 static int			ExpandBlock(lfv_reader_state* sIO);
 static int			ExpandStat(lfv_reader_state* sIO);
 static int			ExpandAttnamelist(lfv_reader_state* sIO);
@@ -67,10 +70,10 @@ static int			ExpandField(lfv_reader_state* sIO, size_t* markedVecCompsOut,
 static int			ExpandFieldsep(lfv_reader_state* sIO);
 static int			ExpandBinop(lfv_reader_state* sIO);
 static int			ExpandUnop(lfv_reader_state* sIO);
-static const char*	DuplicateVecs(lfv_reader_state* sIO, size_t expStart, size_t marksStart,
-					size_t* marksAddedOut);
-static const char*	MergeFields(lfv_reader_state* sIO, size_t marksStart, size_t numMarks,
-					size_t mergeableEnd);
+static int			DuplicateVecs(lfv_reader_state* sIO, unsigned line, size_t expStart,
+					size_t marksStart, size_t* marksAddedOut);
+static int			MergeFields(lfv_reader_state* sIO, unsigned line, size_t marksStart,
+					size_t numMarks, size_t mergeableEnd);
 static const char*	CheckMarkPrefix(const lfv_reader_state* s, size_t markIndex,
 					size_t* compsOut);
 static void			SkipBOMAndPound(lfv_reader_state* sIO);
@@ -106,19 +109,20 @@ static size_t		AddSizeT(lfv_reader_state* sIO, size_t a, size_t b);
 static size_t		MulSizeT(lfv_reader_state* sIO, size_t a, size_t b);
 static void			IncRecursionLevel(lfv_reader_state* sIO);
 static void			DecRecursionLevel(lfv_reader_state* sIO);
+static int			BinaryScript(const lfv_reader_state* s);
 
 /*--------------------------------------
 	lfvExpandFile
 --------------------------------------*/
 char* lfvExpandFile(const char* filePath, int forceExpand, const char* logPath,
-	const char** err, unsigned* errLine)
+	const char** errMsg, unsigned* errLine)
 {
 	lfv_reader_state rs;
 	FILE* f;
 	char* ret = 0;
 	size_t retSize = 0;
 
-	if(err) *err = 0;
+	if(errMsg) *errMsg = 0;
 	if(errLine) *errLine = 0;
 
 	if(filePath)
@@ -128,7 +132,7 @@ char* lfvExpandFile(const char* filePath, int forceExpand, const char* logPath,
 
 	if(!f)
 	{
-		if(err) *err = strerror(errno);
+		if(errMsg) *errMsg = strerror(errno);
 		return 0;
 	}
 
@@ -141,7 +145,7 @@ char* lfvExpandFile(const char* filePath, int forceExpand, const char* logPath,
 
 	if(rs.earliestError)
 	{
-		if(err) *err = rs.earliestError;
+		if(errMsg) *errMsg = rs.earliestError;
 		if(errLine) *errLine = rs.errorLine;
 		lfvTermReaderState(&rs, TRUE);
 		return 0;
@@ -154,14 +158,14 @@ char* lfvExpandFile(const char* filePath, int forceExpand, const char* logPath,
 /*--------------------------------------
 	lfvExpandString
 --------------------------------------*/
-char* lfvExpandString(const char* chunk, int forceExpand, const char* logPath, const char** err,
-	unsigned* errLine)
+char* lfvExpandString(const char* chunk, int forceExpand, const char* logPath,
+	const char** errMsg, unsigned* errLine)
 {
 	lfv_reader_state rs;
 	char* ret = 0;
 	size_t retSize = 0;
 	
-	if(err) *err = 0;
+	if(errMsg) *errMsg = 0;
 	if(errLine) *errLine = 0;
 
 	if(!lfvInitReaderState(chunk, 0, chunk, forceExpand, FALSE, FALSE, logPath, &rs))
@@ -169,7 +173,7 @@ char* lfvExpandString(const char* chunk, int forceExpand, const char* logPath, c
 	
 	if(rs.earliestError)
 	{
-		if(err) *err = rs.earliestError;
+		if(errMsg) *errMsg = rs.earliestError;
 		if(errLine) *errLine = rs.errorLine;
 		lfvTermReaderState(&rs, TRUE);
 		return 0;
@@ -217,7 +221,7 @@ char* lfvReader(void* data, size_t* size)
 /*--------------------------------------
 	lfvInitReaderState
 
-Returns 1 in case of a malloc error and sets error info in s.
+Returns LFV_OK (0) on success. Otherwise, sets error info in s and returns error code.
 --------------------------------------*/
 int lfvInitReaderState(const char* chunk, FILE* file, const char* name, int force, int stream,
 	int skipBOMPound, const char* logPath, lfv_reader_state* s)
@@ -241,6 +245,7 @@ int lfvInitReaderState(const char* chunk, FILE* file, const char* name, int forc
 	s->topResult = force ? EXPAND_INIT_FORCE : EXPAND_INIT;
 	s->earliestError = 0;
 	s->errorLine = 0;
+	s->errorCode = LFV_OK;
 	s->log = 0;
 	s->logPath = logPath;
 
@@ -260,9 +265,9 @@ int lfvInitReaderState(const char* chunk, FILE* file, const char* name, int forc
 
 		if(!s->buf)
 		{
-			SetReaderError(s, "Failed to malloc buf", s->line);
+			SetReaderError(s, "Failed to malloc buf", s->line, LFV_ERR_MEMORY);
 			SetEmptyBufferSize(s);
-			return 1;
+			return s->errorCode;
 		}
 
 		s->chk += CopyStringNoTerm(s->buf, s->chk, s->numBuf);
@@ -271,14 +276,26 @@ int lfvInitReaderState(const char* chunk, FILE* file, const char* name, int forc
 	else if(s->f)
 	{
 		/* Only given a file, allocate buffer and initialize with first read */
-		if(!EnsureBufSize(s, INIT_BUF_SIZE, FALSE) || !s->buf /* suppress warning */)
-			return 1;
+		if(!EnsureBufSize(s, INIT_BUF_SIZE, FALSE))
+			return s->errorCode;
+
+		if(!s->buf) /* Suppress warning */
+		{
+			SetReaderError(s, "s->buf is null", s->line, LFV_ERR_RUNTIME);
+			return s->errorCode;
+		}
 
 		s->numBuf = EOFCheckedFRead(s->buf, 1, INIT_BUF_SIZE - 1, s->f);
 		s->buf[s->numBuf] = 0;
 	}
 
-	return 0;
+	if(BinaryScript(s))
+	{
+		SetReaderError(s, "Chunk is precompiled binary", s->line, LFV_ERR_BINARY);
+		return s->errorCode;
+	}
+
+	return s->errorCode;
 }
 
 /*--------------------------------------
@@ -307,11 +324,39 @@ void lfvTermReaderState(lfv_reader_state* s, int freeBuf)
 }
 
 /*--------------------------------------
+	lfvTruncatedName
+--------------------------------------*/
+char* lfvTruncatedName(const char* name, char* buf, size_t size)
+{
+	const size_t NUM_DOTS = 3;
+	size_t len = 0;
+	for(; len < size - 1 && name[len] && name[len] != '\n'; len++);
+	memcpy(buf, name, len);
+	buf[len] = 0;
+
+	if(name[len])
+	{
+		/* Truncated, append dots */
+		size_t i;
+		size_t end = MIN(size - 1, len + NUM_DOTS);
+		buf[end] = 0;
+
+		for(i = 0; i < NUM_DOTS && end; i++)
+			buf[--end] = '.';
+	}
+
+	return buf;
+}
+
+/*--------------------------------------
 	lfvResolveName
 --------------------------------------*/
-const char* lfvResolveName(const lfv_reader_state* s)
+const char* lfvResolveName(const lfv_reader_state* s, char* buf, size_t size)
 {
-	return s->name ? s->name : (s->f ? "file" : "string");
+	if(s->name)
+		return s->f ? s->name : lfvTruncatedName(s->name, buf, size);
+	else
+		return s->f ? "file" : "string";
 }
 
 /*--------------------------------------
@@ -321,6 +366,7 @@ Don't call this directly, call lfvReader.
 --------------------------------------*/
 static char* ReaderNoSetJmp(void* data, size_t* size)
 {
+	char nameBuf[LFV_NAME_BUF_SIZE];
 	lfv_reader_state* s = (lfv_reader_state*)data;
 	*size = 0;
 
@@ -373,11 +419,13 @@ static char* ReaderNoSetJmp(void* data, size_t* size)
 
 			if(s->log)
 			{
+				const char* name = lfvResolveName(s, nameBuf, sizeof(nameBuf));
+
 				if(s->topResult == EXPAND_OK)
-					fprintf(s->log, LOG_PREFIX "vector expansion of %s\n", lfvResolveName(s));
-				else if(s->name)
+					fprintf(s->log, LOG_PREFIX "vector expansion of '%s'\n", name);
+				else
 				{
-					fprintf(s->log, LOG_PREFIX "not expanding %s\n", s->name);
+					fprintf(s->log, LOG_PREFIX "not expanding '%s'\n", name);
 					fclose(s->log);
 					s->log = 0;
 				}
@@ -408,19 +456,19 @@ static char* ReaderNoSetJmp(void* data, size_t* size)
 					if(s->buf[s->tok])
 					{
 						SetReaderError(s, "Main block contains tokens that do not form a stat "
-							"or retstat", line);
+							"or retstat", line, LFV_ERR_SYNTAX);
 						s->topResult = EXPAND_ERR;
 					}
 				}
 				else if(res == EXPAND_ERR)
 				{
-					SetReaderError(s, "Bad retstat in main block", line);
+					SetReaderError(s, "Bad retstat in main block", line, LFV_ERR_SYNTAX);
 					s->topResult = EXPAND_ERR;
 				}
 			}
 			else if(statRes == EXPAND_ERR)
 			{
-				SetReaderError(s, "Bad stat in main block", line);
+				SetReaderError(s, "Bad stat in main block", line, LFV_ERR_SYNTAX);
 				s->topResult = EXPAND_ERR;
 			}
 
@@ -459,7 +507,7 @@ static char* ReaderNoSetJmp(void* data, size_t* size)
 		if(s->earliestError)
 		{
 			fprintf(s->log, "\n" LOG_PREFIX "expansion error ('%s' ln %u): %s",
-				lfvResolveName(s), s->errorLine, s->earliestError);
+				lfvResolveName(s, nameBuf, sizeof(nameBuf)), s->errorLine, s->earliestError);
 		}
 	}
 
@@ -472,17 +520,16 @@ static char* ReaderNoSetJmp(void* data, size_t* size)
 /*--------------------------------------
 	SetReaderError
 
-str must be constant. Always returns EXPAND_ERR.
+str must be constant.
 --------------------------------------*/
-static int SetReaderError(lfv_reader_state* s, const char* str, unsigned line)
+static void SetReaderError(lfv_reader_state* s, const char* str, unsigned line, int code)
 {
 	if(!s->earliestError)
 	{
 		s->earliestError = str;
 		s->errorLine = line;
+		s->errorCode = code;
 	}
-
-	return EXPAND_ERR;
 }
 
 /*--------------------------------------
@@ -499,11 +546,11 @@ static int ExpandBlock(lfv_reader_state* s)
 		if(res == EXPAND_UNFIT)
 			break;
 		else if(res == EXPAND_ERR)
-			RETURN_ERROR("Bad stat in block");
+			return SYNTAX_ERR("Bad stat in block");
 	}
 
 	if(ExpandRetstat(s) == EXPAND_ERR)
-		RETURN_ERROR("Bad retstat in block");
+		return SYNTAX_ERR("Bad retstat in block");
 
 	return EXPAND_OK;
 }
@@ -528,7 +575,7 @@ static int ExpandStat(lfv_reader_state* s)
 	if(s->buf[s->tok] == ':')
 	{
 		if(ExpandLabel(s) != EXPAND_OK)
-			RETURN_ERROR("Expected label at ':'");
+			return SYNTAX_ERR("Expected label at ':'");
 
 		return EXPAND_OK;
 	}
@@ -546,7 +593,7 @@ static int ExpandStat(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandName(s, FALSE) != EXPAND_OK)
-			RETURN_ERROR("Expected Name after 'goto'");
+			return SYNTAX_ERR("Expected Name after 'goto'");
 
 		return EXPAND_OK;
 	}
@@ -556,12 +603,12 @@ static int ExpandStat(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandBlock(s) != EXPAND_OK)
-			RETURN_ERROR("Expected block after 'do'");
+			return SYNTAX_ERR("Expected block after 'do'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 
 		if(!EqualToken(s, "end"))
-			RETURN_ERROR("Expected 'end' after 'do block'");
+			return SYNTAX_ERR("Expected 'end' after 'do block'");
 
 		NextTokenSkipCom(s);
 		return EXPAND_OK;
@@ -572,22 +619,22 @@ static int ExpandStat(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandExp(s, 0) != EXPAND_OK)
-			RETURN_ERROR("Expected exp after 'while'");
+			return SYNTAX_ERR("Expected exp after 'while'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 		
 		if(!EqualToken(s, "do"))
-			RETURN_ERROR("Expected 'do' after 'while exp'");
+			return SYNTAX_ERR("Expected 'do' after 'while exp'");
 
 		NextTokenSkipCom(s);
 
 		if(ExpandBlock(s) != EXPAND_OK)
-			RETURN_ERROR("Expected block after 'while exp do'");
+			return SYNTAX_ERR("Expected block after 'while exp do'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 
 		if(!EqualToken(s, "end"))
-			RETURN_ERROR("Expected 'end' after 'while exp do block'");
+			return SYNTAX_ERR("Expected 'end' after 'while exp do block'");
 
 		NextTokenSkipCom(s);
 		return EXPAND_OK;
@@ -598,17 +645,17 @@ static int ExpandStat(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandBlock(s) != EXPAND_OK)
-			RETURN_ERROR("Expected block after 'repeat'");
+			return SYNTAX_ERR("Expected block after 'repeat'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 
 		if(!EqualToken(s, "until"))
-			RETURN_ERROR("Expected 'until' after 'repeat block'");
+			return SYNTAX_ERR("Expected 'until' after 'repeat block'");
 
 		NextTokenSkipCom(s);
 
 		if(ExpandExp(s, 0) != EXPAND_OK)
-			RETURN_ERROR("Expected exp after 'repeat block until'");
+			return SYNTAX_ERR("Expected exp after 'repeat block until'");
 
 		return EXPAND_OK;
 	}
@@ -618,17 +665,17 @@ static int ExpandStat(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandExp(s, 0) != EXPAND_OK)
-			RETURN_ERROR("Expected exp after 'if'");
+			return SYNTAX_ERR("Expected exp after 'if'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 
 		if(!EqualToken(s, "then"))
-			RETURN_ERROR("Expected 'then' after 'if exp'");
+			return SYNTAX_ERR("Expected 'then' after 'if exp'");
 
 		NextTokenSkipCom(s);
 
 		if(ExpandBlock(s) != EXPAND_OK)
-			RETURN_ERROR("Expected block after 'if exp then'");
+			return SYNTAX_ERR("Expected block after 'if exp then'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 
@@ -637,17 +684,17 @@ static int ExpandStat(lfv_reader_state* s)
 			NextTokenSkipCom(s);
 
 			if(ExpandExp(s, 0) != EXPAND_OK)
-				RETURN_ERROR("Expected exp after 'elseif'");
+				return SYNTAX_ERR("Expected exp after 'elseif'");
 
 			ExtendToken(s, IDENTIFIER_CHARS);
 
 			if(!EqualToken(s, "then"))
-				RETURN_ERROR("Expected 'then' after 'elseif exp'");
+				return SYNTAX_ERR("Expected 'then' after 'elseif exp'");
 
 			NextTokenSkipCom(s);
 
 			if(ExpandBlock(s) != EXPAND_OK)
-				RETURN_ERROR("Expected block after 'elseif exp then'");
+				return SYNTAX_ERR("Expected block after 'elseif exp then'");
 
 			ExtendToken(s, IDENTIFIER_CHARS);
 		}
@@ -657,16 +704,15 @@ static int ExpandStat(lfv_reader_state* s)
 			NextTokenSkipCom(s);
 
 			if(ExpandBlock(s) != EXPAND_OK)
-				RETURN_ERROR("Expected block after 'else'");
+				return SYNTAX_ERR("Expected block after 'else'");
 
 			ExtendToken(s, IDENTIFIER_CHARS);
 		}
 
 		if(!EqualToken(s, "end"))
 		{
-			RETURN_ERROR("Expected 'end' after 'if exp then block {elseif exp then block} "
+			return SYNTAX_ERR("Expected 'end' after 'if exp then block {elseif exp then block} "
 				"[else block]'");
-			return EXPAND_ERR;
 		}
 
 		NextTokenSkipCom(s);
@@ -678,7 +724,7 @@ static int ExpandStat(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandExplist(s) != EXPAND_OK)
-			RETURN_ERROR("Expected explist after 'for'");
+			return SYNTAX_ERR("Expected explist after 'for'");
 
 		ExtendTokenSize(s, 1);
 
@@ -687,28 +733,28 @@ static int ExpandStat(lfv_reader_state* s)
 			ExtendToken(s, IDENTIFIER_CHARS);
 
 			if(!EqualToken(s, "in"))
-				RETURN_ERROR("Expected '=' or 'in' after 'for explist'");
+				return SYNTAX_ERR("Expected '=' or 'in' after 'for explist'");
 		}
 
 		NextTokenSkipCom(s);
 
 		if(ExpandExplist(s) != EXPAND_OK)
-			RETURN_ERROR("Expected explist after 'for explist =|in'");
+			return SYNTAX_ERR("Expected explist after 'for explist =|in'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 
 		if(!EqualToken(s, "do"))
-			RETURN_ERROR("Expected 'do' after 'for explist =|in explist'");
+			return SYNTAX_ERR("Expected 'do' after 'for explist =|in explist'");
 
 		NextTokenSkipCom(s);
 
 		if(ExpandBlock(s) != EXPAND_OK)
-			RETURN_ERROR("Expected block after 'for explist =|in explist do'");
+			return SYNTAX_ERR("Expected block after 'for explist =|in explist do'");
 
 		ExtendToken(s, IDENTIFIER_CHARS);
 
 		if(!EqualToken(s, "end"))
-			RETURN_ERROR("Expected 'end' after 'for explist =|in explist do block'");
+			return SYNTAX_ERR("Expected 'end' after 'for explist =|in explist do block'");
 
 		NextTokenSkipCom(s);
 		return EXPAND_OK;
@@ -719,10 +765,10 @@ static int ExpandStat(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandFuncname(s) != EXPAND_OK)
-			RETURN_ERROR("Expected funcname after 'function'");
+			return SYNTAX_ERR("Expected funcname after 'function'");
 
 		if(ExpandFuncbody(s) != EXPAND_OK)
-			RETURN_ERROR("Expected funcbody after 'function funcname'");
+			return SYNTAX_ERR("Expected funcbody after 'function funcname'");
 
 		return EXPAND_OK;
 	}
@@ -737,22 +783,22 @@ static int ExpandStat(lfv_reader_state* s)
 			NextTokenSkipCom(s);
 
 			if(ExpandName(s, FALSE) != EXPAND_OK)
-				RETURN_ERROR("Expected Name after 'local function'");
+				return SYNTAX_ERR("Expected Name after 'local function'");
 
 			if(ExpandFuncbody(s) != EXPAND_OK)
-				RETURN_ERROR("Expected funcbody after 'local function Name'");
+				return SYNTAX_ERR("Expected funcbody after 'local function Name'");
 		}
 		else
 		{
 			if(ExpandAttnamelist(s) != EXPAND_OK)
-				RETURN_ERROR("Expected 'function' or attnamelist after 'local'");
+				return SYNTAX_ERR("Expected 'function' or attnamelist after 'local'");
 
 			if(ExtendToken(s, "=") == 1)
 			{
 				NextTokenSkipCom(s);
 
 				if(ExpandExplist(s) != EXPAND_OK)
-					RETURN_ERROR("Expected explist after 'local attnamelist ='");
+					return SYNTAX_ERR("Expected explist after 'local attnamelist ='");
 			}
 		}
 
@@ -775,13 +821,13 @@ static int ExpandStat(lfv_reader_state* s)
 			NextTokenSkipCom(s);
 
 			if(ExpandExplist(s) != EXPAND_OK)
-				RETURN_ERROR("Expected explist after 'explist ='");
+				return SYNTAX_ERR("Expected explist after 'explist ='");
 		}
 
 		return EXPAND_OK;
 	}
 	else if(res == EXPAND_ERR)
-		RETURN_ERROR("Bad explist at start of stat");
+		return SYNTAX_ERR("Bad explist at start of stat");
 
 	return EXPAND_UNFIT;
 }
@@ -797,13 +843,13 @@ static int ExpandAttnamelist(lfv_reader_state* s)
 	while(1)
 	{
 		int res = ExpandAttname(s);
-
+		
 		if(res != EXPAND_OK)
 		{
 			if(res == EXPAND_ERR)
-				RETURN_ERROR("Bad attname in attnamelist");
+				return SYNTAX_ERR("Bad attname in attnamelist");
 			else if(numNames)
-				RETURN_ERROR("attnamelist expected attname after ','");
+				return SYNTAX_ERR("attnamelist expected attname after ','");
 			else
 				return EXPAND_UNFIT;
 		}
@@ -825,7 +871,6 @@ static int ExpandAttnamelist(lfv_reader_state* s)
 static int ExpandAttname(lfv_reader_state* s)
 {
 	unsigned line = s->line;
-	const char* err;
 	size_t start = s->tok;
 	size_t saveNumMarks = s->numMarks;
 	int res = ExpandName(s, TRUE);
@@ -834,10 +879,10 @@ static int ExpandAttname(lfv_reader_state* s)
 		return res;
 
 	if(ExpandAttrib(s) == EXPAND_ERR)
-		RETURN_ERROR("Bad attrib in attname");
+		return SYNTAX_ERR("Bad attrib in attname");
 
-	if(err = DuplicateVecs(s, start, saveNumMarks, 0))
-		RETURN_ERROR(err);
+	if((res = DuplicateVecs(s, line, start, saveNumMarks, 0)) != EXPAND_OK)
+		return SYNTAX_ERR("Failed duplication of vectors in attname");
 
 	return EXPAND_OK;
 }
@@ -856,10 +901,10 @@ static int ExpandAttrib(lfv_reader_state* s)
 	NextTokenSkipCom(s);
 
 	if(ExpandName(s, FALSE) != EXPAND_OK)
-		RETURN_ERROR("attrib expected Name after '<'");
+		return SYNTAX_ERR("attrib expected Name after '<'");
 
 	if(ExtendToken(s, ">") != 1)
-		RETURN_ERROR("attrib expected '>' after '<Name'");
+		return SYNTAX_ERR("attrib expected '>' after '<Name'");
 
 	NextTokenSkipCom(s);
 	return EXPAND_OK;
@@ -879,7 +924,7 @@ static int ExpandRetstat(lfv_reader_state* s)
 	NextTokenSkipCom(s);
 
 	if(ExpandExplist(s) == EXPAND_ERR)
-		RETURN_ERROR("Bad explist after 'return'");
+		return SYNTAX_ERR("Bad explist after 'return'");
 
 	if(s->buf[s->tok] == ';')
 		NextTokenSkipCom(s);
@@ -901,12 +946,12 @@ static int ExpandLabel(lfv_reader_state* s)
 	NextTokenSkipCom(s);
 
 	if(ExpandName(s, FALSE) != EXPAND_OK)
-		RETURN_ERROR("label expected Name after '::'");
+		return SYNTAX_ERR("label expected Name after '::'");
 
 	ExtendToken(s, ":");
 
 	if(s->tokSize != 2)
-		RETURN_ERROR("label expected '::' after '::Name'");
+		return SYNTAX_ERR("label expected '::' after '::Name'");
 
 	NextTokenSkipCom(s);
 	return EXPAND_OK;
@@ -1012,7 +1057,7 @@ static int ExpandNumeral(lfv_reader_state* s)
 			for(cur++; StrChrNull("0123456789abcdef", tolower(tok[cur])); cur++, digits++);
 
 		if(!digits)
-			RETURN_ERROR("Hex numeral must have a digit");
+			return SYNTAX_ERR("Hex numeral must have a digit");
 	}
 	else
 	{
@@ -1038,7 +1083,7 @@ static int ExpandNumeral(lfv_reader_state* s)
 		for(; StrChrNull("0123456789", tok[cur]); cur++);
 
 		if(cur == save)
-			RETURN_ERROR("Exponent of numeral must have a digit");
+			return SYNTAX_ERR("Exponent of numeral must have a digit");
 	}
 
 	s->tokSize = cur;
@@ -1073,7 +1118,7 @@ static int ExpandString(lfv_reader_state* s)
 				return EXPAND_OK;
 			}
 			else
-				RETURN_ERROR("Unclosed short string literal");
+				return SYNTAX_ERR("Unclosed short string literal");
 		}
 	}
 	else if(SkipLongBracket(s))
@@ -1102,7 +1147,7 @@ static int ExpandFuncname(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandName(s, FALSE) != EXPAND_OK)
-			RETURN_ERROR("funcname expected Name after 'Name.'");
+			return SYNTAX_ERR("funcname expected Name after 'Name.'");
 	}
 
 	if(s->buf[s->tok] == ':')
@@ -1110,7 +1155,7 @@ static int ExpandFuncname(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandName(s, FALSE) != EXPAND_OK)
-			RETURN_ERROR("funcname expected Name after ':'");
+			return SYNTAX_ERR("funcname expected Name after ':'");
 	}
 
 	return EXPAND_OK;
@@ -1134,7 +1179,7 @@ static int ExpandExplist(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandExp(s, 0) != EXPAND_OK)
-			RETURN_ERROR("explist expected exp after ','");
+			return SYNTAX_ERR("explist expected exp after ','");
 	}
 
 	return EXPAND_OK;
@@ -1146,17 +1191,11 @@ static int ExpandExplist(lfv_reader_state* s)
 If dd is given, vector Names are left marked and dd's members are filled. Otherwise,
 DuplicateVecs is called for the marks found.
 --------------------------------------*/
-#define EXP_ERROR(str) \
-{ \
-	s->numMarks = saveNumMarks; \
-	DecRecursionLevel(s); \
-	return SetReaderError(s, str, line); \
-}
+#define EXP_ERROR(str) return (s->numMarks = saveNumMarks, DecRecursionLevel(s), SYNTAX_ERR(str))
 
 static int ExpandExp(lfv_reader_state* s, delayed_duplication* dd)
 {
 	unsigned line = s->line;
-	const char* err;
 	size_t start = s->tok;
 	int hang = TRUE; /* Next token should be a ref or value (true on start and after
 					 operator) */
@@ -1389,8 +1428,8 @@ static int ExpandExp(lfv_reader_state* s, delayed_duplication* dd)
 		dd->expStart = start;
 		dd->marksStart = saveNumMarks;
 	}
-	else if(err = DuplicateVecs(s, start, saveNumMarks, 0))
-		EXP_ERROR(err);
+	else if(DuplicateVecs(s, line, start, saveNumMarks, 0) != EXPAND_OK)
+		EXP_ERROR("Failed duplication of vectors in exp");
 
 	DecRecursionLevel(s);
 	return start == s->tok ? EXPAND_UNFIT : EXPAND_OK;
@@ -1410,10 +1449,10 @@ static int ExpandArgs(lfv_reader_state* s)
 		NextTokenSkipCom(s);
 
 		if(ExpandExplist(s) == EXPAND_ERR)
-			RETURN_ERROR("Bad explist after '(' in args");
+			return SYNTAX_ERR("Bad explist after '(' in args");
 
 		if(s->buf[s->tok] != ')')
-			RETURN_ERROR("Expected ')' after '(explist' in args");
+			return SYNTAX_ERR("Expected ')' after '(explist' in args");
 
 		NextTokenSkipCom(s);
 		return EXPAND_OK;
@@ -1424,14 +1463,14 @@ static int ExpandArgs(lfv_reader_state* s)
 	if(res == EXPAND_OK)
 		return EXPAND_OK;
 	else if(res == EXPAND_ERR)
-		RETURN_ERROR("Bad tableconstructor in args");
+		return SYNTAX_ERR("Bad tableconstructor in args");
 
 	res = ExpandString(s);
 
 	if(res == EXPAND_OK)
 		return EXPAND_OK;
 	else if(res == EXPAND_ERR)
-		RETURN_ERROR("Bad LiteralString in args");
+		return SYNTAX_ERR("Bad LiteralString in args");
 
 	return EXPAND_UNFIT;
 }
@@ -1450,7 +1489,7 @@ static int ExpandFunctiondef(lfv_reader_state* s)
 	NextTokenSkipCom(s);
 
 	if(ExpandFuncbody(s) != EXPAND_OK)
-		RETURN_ERROR("functiondef expected funcbody after 'function'");
+		return SYNTAX_ERR("functiondef expected funcbody after 'function'");
 
 	return EXPAND_OK;
 }
@@ -1469,22 +1508,22 @@ static int ExpandFuncbody(lfv_reader_state* s)
 	NextTokenSkipCom(s);
 
 	if(ExpandExplist(s) == EXPAND_ERR)
-		RETURN_ERROR("Bad explist in funcbody after '('");
+		return SYNTAX_ERR("Bad explist in funcbody after '('");
 
 	ExtendTokenSize(s, 1);
 
 	if(s->buf[s->tok] != ')')
-		RETURN_ERROR("funcbody expected ')' after '(explist'");
+		return SYNTAX_ERR("funcbody expected ')' after '(explist'");
 
 	NextTokenSkipCom(s);
 
 	if(ExpandBlock(s) != EXPAND_OK)
-		RETURN_ERROR("funcbody expected block after '(explist)'");
+		return SYNTAX_ERR("funcbody expected block after '(explist)'");
 
 	ExtendToken(s, IDENTIFIER_CHARS);
 
 	if(!EqualToken(s, "end"))
-		RETURN_ERROR("funcbody expected 'end' after '(explist) block'");
+		return SYNTAX_ERR("funcbody expected 'end' after '(explist) block'");
 
 	NextTokenSkipCom(s);
 	return EXPAND_OK;
@@ -1504,12 +1543,12 @@ static int ExpandTableconstructor(lfv_reader_state* s)
 	NextTokenSkipCom(s);
 
 	if(ExpandFieldlist(s) == EXPAND_ERR)
-		RETURN_ERROR("Bad fieldlist in tableconstructor");
+		return SYNTAX_ERR("Bad fieldlist in tableconstructor");
 
 	ExtendTokenSize(s, 1);
 
 	if(s->buf[s->tok] != '}')
-		RETURN_ERROR("tableconstructor expected '}' after '{fieldlist'");
+		return SYNTAX_ERR("tableconstructor expected '}' after '{fieldlist'");
 
 	NextTokenSkipCom(s);
 	return EXPAND_OK;
@@ -1518,14 +1557,16 @@ static int ExpandTableconstructor(lfv_reader_state* s)
 /*--------------------------------------
 	ExpandFieldlist
 --------------------------------------*/
+#define UNMERGEABLE_MSG "Failed merge of fields in fieldlist"
+#define UNMERGEABLE_ERR() SYNTAX_ERR(UNMERGEABLE_MSG)
+
 static int ExpandFieldlist(lfv_reader_state* s)
 {
 	size_t marksStart = 0;
 	size_t prepComps = 0;
 	size_t remExps = 0;
 	size_t mergeableEnd = 0;
-	int prepLine = s->line;
-	const char* err;
+	int ret;
 
 	while(1)
 	{
@@ -1533,10 +1574,10 @@ static int ExpandFieldlist(lfv_reader_state* s)
 		unsigned line = s->line;
 		size_t saveNumMarks = s->numMarks;
 		size_t markedVecComps = 0, markedExps = 0;
-		int ret = ExpandField(s, &markedVecComps, &markedExps);
+		ret = ExpandField(s, &markedVecComps, &markedExps);
 
 		if(ret == EXPAND_ERR)
-			RETURN_ERROR("Bad field in fieldlist");
+			return SYNTAX_ERR("Bad field in fieldlist");
 		else if(ret == EXPAND_UNFIT)
 			break;
 
@@ -1547,8 +1588,8 @@ static int ExpandFieldlist(lfv_reader_state* s)
 			if(prepComps)
 			{
 				/* We're still prepping the last vector; cancel further prep and merge now */
-				if(err = MergeFields(s, marksStart, prepComps - remExps, mergeableEnd))
-					RETURN_ERROR(err);
+				if(MergeFields(s, line, marksStart, prepComps - remExps, mergeableEnd) != EXPAND_OK)
+					return UNMERGEABLE_ERR();
 			}
 
 			/* Start prep */
@@ -1556,7 +1597,6 @@ static int ExpandFieldlist(lfv_reader_state* s)
 			prepComps = markedVecComps;
 			remExps = prepComps - 1;
 			mergeableEnd = s->beforeSkip;
-			prepLine = line;
 		}
 
 		if(prepComps)
@@ -1566,7 +1606,7 @@ static int ExpandFieldlist(lfv_reader_state* s)
 			{
 				/* ExpandField marked mergeable expression(s) */
 				if(markedExps > remExps)
-					RETURN_ERROR("exp duplicates too many times for left-hand vector in fieldlist");
+					return RUNTIME_ERR("exp duplicates too many times for left-hand vector in fieldlist");
 
 				remExps -= markedExps;
 				mergeableEnd = s->beforeSkip;
@@ -1574,8 +1614,8 @@ static int ExpandFieldlist(lfv_reader_state* s)
 				if(!remExps)
 				{
 					/* Prep is finished; merge */
-					if(err = MergeFields(s, marksStart, prepComps, mergeableEnd))
-						RETURN_ERROR(err);
+					if(MergeFields(s, line, marksStart, prepComps, mergeableEnd) != EXPAND_OK)
+						return UNMERGEABLE_ERR();
 
 					prepComps = 0;
 				}
@@ -1584,8 +1624,8 @@ static int ExpandFieldlist(lfv_reader_state* s)
 			{
 				/* We're prepping and ExpandField did not mark anything; cancel further prep and
 				merge now */
-				if(err = MergeFields(s, marksStart, prepComps - remExps, mergeableEnd))
-					RETURN_ERROR(err);
+				if(MergeFields(s, line, marksStart, prepComps - remExps, mergeableEnd) != EXPAND_OK)
+					return UNMERGEABLE_ERR();
 
 				prepComps = 0;
 			}
@@ -1597,7 +1637,7 @@ static int ExpandFieldlist(lfv_reader_state* s)
 		ret = ExpandFieldsep(s);
 
 		if(ret == EXPAND_ERR)
-			RETURN_ERROR("Bad fieldsep in fieldlist");
+			return SYNTAX_ERR("Bad fieldsep in fieldlist");
 		else if(ret == EXPAND_UNFIT)
 			break;
 	}
@@ -1605,8 +1645,8 @@ static int ExpandFieldlist(lfv_reader_state* s)
 	if(prepComps)
 	{
 		/* fieldlist is done but we're still prepping; merge now */
-		if(err = MergeFields(s, marksStart, prepComps - remExps, mergeableEnd))
-			return SetReaderError(s, err, s->line);
+		if(MergeFields(s, s->line, marksStart, prepComps - remExps, mergeableEnd) != EXPAND_OK)
+			return (SetReaderError(s, UNMERGEABLE_MSG, s->line, LFV_ERR_SYNTAX), EXPAND_ERR);
 
 		prepComps = 0;
 	}
@@ -1630,7 +1670,6 @@ static int ExpandField(lfv_reader_state* s, size_t* markedVecComps, size_t* mark
 {
 	unsigned line = s->line;
 	int ret;
-	const char* err;
 	delayed_duplication dd;
 	ExtendTokenSize(s, 1);
 
@@ -1640,23 +1679,23 @@ static int ExpandField(lfv_reader_state* s, size_t* markedVecComps, size_t* mark
 		NextTokenSkipCom(s);
 
 		if(ExpandExp(s, 0) != EXPAND_OK)
-			RETURN_ERROR("field expected exp after '['");
+			return SYNTAX_ERR("field expected exp after '['");
 
 		ExtendTokenSize(s, 1);
 
 		if(s->buf[s->tok] != ']')
-			RETURN_ERROR("field expected ']' after '[exp'");
+			return SYNTAX_ERR("field expected ']' after '[exp'");
 
 		NextTokenSkipCom(s);
 		ExtendTokenSize(s, 1);
 
 		if(s->buf[s->tok] != '=')
-			RETURN_ERROR("field expected '=' after '[exp]'");
+			return SYNTAX_ERR("field expected '=' after '[exp]'");
 
 		NextTokenSkipCom(s);
 
 		if(ExpandExp(s, 0) != EXPAND_OK)
-			RETURN_ERROR("field expected exp after '[exp] ='");
+			return SYNTAX_ERR("field expected exp after '[exp] ='");
 
 		return EXPAND_OK;
 	}
@@ -1669,7 +1708,7 @@ static int ExpandField(lfv_reader_state* s, size_t* markedVecComps, size_t* mark
 	ret = ExpandExp(s, &dd);
 
 	if(ret == EXPAND_ERR)
-		RETURN_ERROR("Bad exp in field");
+		return SYNTAX_ERR("Bad exp in field");
 	else if(ret == EXPAND_UNFIT)
 		return EXPAND_UNFIT;
 
@@ -1680,12 +1719,14 @@ static int ExpandField(lfv_reader_state* s, size_t* markedVecComps, size_t* mark
 		size_t numNameVecs = s->numMarks - dd.marksStart;
 
 		if(numNameVecs > 1)
-			RETURN_ERROR("field expected 'exp =' to contain no more than one vector Name");
+			return SYNTAX_ERR("field expected 'exp =' to contain no more than one vector Name");
 
 		if(markedVecComps)
 		{
+			const char* err;
+
 			if(numNameVecs && (err = CheckMarkPrefix(s, s->numMarks - 1, markedVecComps)))
-				RETURN_ERROR(err);
+				return SYNTAX_ERR(err);
 		}
 		else
 			s->numMarks = dd.marksStart; /* Caller isn't tracking; discard the mark */
@@ -1693,10 +1734,10 @@ static int ExpandField(lfv_reader_state* s, size_t* markedVecComps, size_t* mark
 		NextTokenSkipCom(s);
 
 		if(ExpandExp(s, &dd) != EXPAND_OK)
-			RETURN_ERROR("field expected exp after 'exp ='");
+			return SYNTAX_ERR("field expected exp after 'exp ='");
 
-		if(err = DuplicateVecs(s, dd.expStart, dd.marksStart, markedExps))
-			RETURN_ERROR(err);
+		if(DuplicateVecs(s, line, dd.expStart, dd.marksStart, markedExps) != EXPAND_OK)
+			return SYNTAX_ERR("Failed duplication of vectors in right-hand exp of field");
 
 		if(markedExps && *markedExps)
 		{
@@ -1709,8 +1750,8 @@ static int ExpandField(lfv_reader_state* s, size_t* markedVecComps, size_t* mark
 	}
 
 	/* exp */
-	if(err = DuplicateVecs(s, dd.expStart, dd.marksStart, markedExps))
-		RETURN_ERROR(err);
+	if(DuplicateVecs(s, line, dd.expStart, dd.marksStart, markedExps) != EXPAND_OK)
+		return SYNTAX_ERR("Failed duplication of vectors in exp of field");
 
 	return EXPAND_OK;
 }
@@ -1846,14 +1887,14 @@ static int ExpandUnop(lfv_reader_state* s)
 /*--------------------------------------
 	DuplicateVecs
 
-Returns 0 on success or an error string.
+Returns EXPAND_OK or EXPAND_ERR. Given line is only used for errors.
 
 s->marks[marksStart .. s->numMarks - 1] must point to vector prefixes. Expression is kept as is
 if no marks are given. If marksAdded is given, the expression and its duplicates are marked
 (after the vector marks are consumed) and *marksAdded is set to the number of new marks.
 --------------------------------------*/
-static const char* DuplicateVecs(lfv_reader_state* s, size_t expStart, size_t marksStart,
-	size_t* marksAdded)
+static int DuplicateVecs(lfv_reader_state* s, unsigned line, size_t expStart,
+	size_t marksStart, size_t* marksAdded)
 {
 	const char COMPS[4] = {'x', 'y', 'z', 'w'};
 	size_t i;
@@ -1870,7 +1911,7 @@ static const char* DuplicateVecs(lfv_reader_state* s, size_t expStart, size_t ma
 			*marksAdded = 1;
 		}
 
-		return 0;
+		return EXPAND_OK;
 	}
 
 	/* Find minimum vector size in expression */
@@ -1880,7 +1921,7 @@ static const char* DuplicateVecs(lfv_reader_state* s, size_t expStart, size_t ma
 		const char* err = CheckMarkPrefix(s, i, &num);
 
 		if(err)
-			return err;
+			return SYNTAX_ERR(err);
 
 		if(num < minVec)
 			minVec = num;
@@ -1900,7 +1941,7 @@ static const char* DuplicateVecs(lfv_reader_state* s, size_t expStart, size_t ma
 	{
 		dupStarts[i] = expStart + (expLen + 1) * i;
 		s->buf[dupStarts[i] - 1] = ',';
-		strncpy(&s->buf[dupStarts[i]], &s->buf[expStart], expLen);
+		memcpy(&s->buf[dupStarts[i]], &s->buf[expStart], expLen);
 	}
 
 	/* Change names to be per-component */
@@ -1960,13 +2001,13 @@ static const char* DuplicateVecs(lfv_reader_state* s, size_t expStart, size_t ma
 		*marksAdded = minVec;
 	}
 
-	return 0;
+	return EXPAND_OK;
 }
 
 /*--------------------------------------
 	MergeFields
 
-Returns 0 on success or an error string.
+Returns EXPAND_OK or EXPAND_ERR. Given line is only used for errors.
 
 The first mark is the left-hand-vector's prefix.
 Each subsequent mark is on each expression in sequence that is not assigned to a variable.
@@ -1976,7 +2017,7 @@ mergeableEnd is the end index of the last field that will be merged to this vect
  ^                        ^            ^          ^
  mark0                    mark1        mark2      mergeableEnd
 --------------------------------------*/
-static const char* MergeFields(lfv_reader_state* s, size_t marksStart, size_t numMarks,
+static int MergeFields(lfv_reader_state* s, unsigned line, size_t marksStart, size_t numMarks,
 	size_t mergeableEnd)
 {
 	const char COMPS[4] = {'x', 'y', 'z', 'w'};
@@ -1989,19 +2030,19 @@ static const char* MergeFields(lfv_reader_state* s, size_t marksStart, size_t nu
 	size_t i;
 
 	if(!numMarks)
-		return "MergeFields called without marks";
+		return RUNTIME_ERR("MergeFields called without marks");
 
 	/* Turn first vector prefix into x component */
 	vecName = s->buf + s->marks[marksStart];
 	
-	if(err = CheckMarkPrefix(s, marksStart, &wantComps))
-		return err;
+	if((err = CheckMarkPrefix(s, marksStart, &wantComps)))
+		return SYNTAX_ERR(err);
 
-	if(wantComps > 4) /* suppress warning */
-		return "MergeFields got a vector prefix with more than 4 components";
+	if(wantComps > 4) /* Suppress warning */
+		return RUNTIME_ERR("MergeFields got a vector prefix with more than 4 components");
 
 	if(numMarks > wantComps)
-		return "MergeFields got too many marks for the given vector Name";
+		return RUNTIME_ERR("MergeFields got too many marks for the given vector Name");
 
 	qua = (wantComps == 4) ? 1 : 0;
 
@@ -2030,7 +2071,7 @@ static const char* MergeFields(lfv_reader_state* s, size_t marksStart, size_t nu
 		size_t insert = s->marks[marksStart + i];
 
 		if(insert > mergeableEnd)
-			return "MergeFields got a mark past mergeableEnd";
+			return RUNTIME_ERR("MergeFields got a mark past mergeableEnd");
 
 		CopyShiftRight(s, insert, leftAssignLen, TRUE);
 		mergeableEnd += leftAssignLen;
@@ -2052,13 +2093,13 @@ static const char* MergeFields(lfv_reader_state* s, size_t marksStart, size_t nu
 		{
 			s->buf[insert++] = ',';
 			WRITE_VECTOR_LEFT_ASSIGNMENT;
-			strncpy(s->buf + insert, "nil", 3);
+			memcpy(s->buf + insert, "nil", 3);
 			insert += 3;
 		}
 	}
 
 	RemoveMarks(s, marksStart, numMarks);
-	return err;
+	return EXPAND_OK;
 }
 
 /*--------------------------------------
@@ -2126,6 +2167,7 @@ static size_t WhitespaceSpan(const char* str, unsigned* line)
 		{
 			case '\n':
 				(*line)++;
+				/* fall through */
 			case ' ':
 			case '\t':
 			case '\f':
@@ -2571,7 +2613,7 @@ static size_t EnsureBufSize(lfv_reader_state* s, size_t n, int doMemJmp)
 
 		if(!s->buf)
 		{
-			SetReaderError(s, "Failed to EnsureBufSize", s->line);
+			SetReaderError(s, "Failed to EnsureBufSize", s->line, LFV_ERR_MEMORY);
 			SetEmptyBufferSize(s);
 
 			if(doMemJmp)
@@ -2598,7 +2640,7 @@ static size_t EnsureNumMarksAlloc(lfv_reader_state* s, size_t n, int doMemJmp)
 
 		if(!s->marks)
 		{
-			SetReaderError(s, "Failed to EnsureNumMarksAlloc", s->line);
+			SetReaderError(s, "Failed to EnsureNumMarksAlloc", s->line, LFV_ERR_MEMORY);
 			s->numMarks = s->numMarksAlloc = 0;
 
 			if(doMemJmp)
@@ -2664,7 +2706,7 @@ static size_t AddSizeT(lfv_reader_state* s, size_t a, size_t b)
 
 	if(c < a)
 	{
-		SetReaderError(s, "size_t add wrapped around", s->line);
+		SetReaderError(s, "size_t add wrapped around", s->line, LFV_ERR_RUNTIME);
 		longjmp(s->memErrJmp, 1);
 	}
 
@@ -2680,7 +2722,7 @@ static size_t MulSizeT(lfv_reader_state* s, size_t a, size_t b)
 
 	if(a && c / a != b)
 	{
-		SetReaderError(s, "size_t multiply wrapped around", s->line);
+		SetReaderError(s, "size_t multiply wrapped around", s->line, LFV_ERR_RUNTIME);
 		longjmp(s->memErrJmp, 1);
 	}
 
@@ -2697,7 +2739,7 @@ static void IncRecursionLevel(lfv_reader_state* s)
 	if(s->level > MAX_RECURSION_LEVELS)
 	{
 		SetReaderError(s, "Recursion went over " STRINGIFY(MAX_RECURSION_LEVELS) " levels",
-			s->line);
+			s->line, LFV_ERR_RUNTIME);
 
 		longjmp(s->memErrJmp, 1);
 	}
@@ -2711,11 +2753,23 @@ static void DecRecursionLevel(lfv_reader_state* s)
 	s->level--;
 }
 
+/*--------------------------------------
+	BinaryScript
+
+s->buf must contain the initial null-terminated read.
+--------------------------------------*/
+static int BinaryScript(const lfv_reader_state* s)
+{
+	const char *a = s->buf, *b = BINARY_SIGNATURE;
+	for(; *a && *b && *a == *b; a++, b++);
+	return *b ? FALSE : TRUE;
+}
+
 /*
 Copyright (C) 2025 Martynas Ceicys
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software
-and associated documentation files (the “Software”), to deal in the Software without
+and associated documentation files (the "Software"), to deal in the Software without
 restriction, including without limitation the rights to use, copy, modify, merge, publish,
 distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
 Software is furnished to do so, subject to the following conditions:
@@ -2723,7 +2777,7 @@ Software is furnished to do so, subject to the following conditions:
 The above copyright notice and this permission notice shall be included in all copies or
 substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
 BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
 NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
