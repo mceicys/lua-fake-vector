@@ -7,10 +7,11 @@ LUA_DIR ?= .
 CC= gcc -std=gnu99
 INCLUDE = -I$(LUA_DIR) -I$(LUA_DIR)/include -I$(LUA_DIR)/src
 CFLAGS = -O2 -Wall -Wextra $(INCLUDE)
+MKDIR = mkdir -v -p
 
-INSTALL_PREFIX = /usr/local
-INSTALL_BIN_DIR = $(INSTALL_PREFIX)/bin
-INSTALL_CMOD_DIR = $(INSTALL_PREFIX)/lib/lua/$(LUA_VERSION)
+INSTALL_TOP = /usr/local
+INSTALL_BIN = $(INSTALL_TOP)/bin
+INSTALL_CMOD = $(INSTALL_TOP)/lib/lua/$(LUA_VERSION)
 
 LFV_SRC = lfv.c
 LFVLUA_SRC = lfvlua.c
@@ -29,16 +30,18 @@ uninstall: uninstall_cmodule uninstall_lfvutil
 
 # Individual (un)install targets
 install_cmodule: lfv.so
-	install -t $(INSTALL_CMOD_DIR) lfv.so
+	$(MKDIR) $(INSTALL_CMOD)
+	install -t $(INSTALL_CMOD) lfv.so
 
 uninstall_cmodule:
-	$(RM) $(INSTALL_CMOD_DIR)/lfv.so
+	$(RM) $(INSTALL_CMOD)/lfv.so
 
 install_lfvutil: lfvutil
-	install -t $(INSTALL_BIN_DIR) lfvutil
+	$(MKDIR) $(INSTALL_BIN)
+	install -t $(INSTALL_BIN) lfvutil
 
 uninstall_lfvutil:
-	$(RM) $(INSTALL_BIN_DIR)/lfvutil
+	$(RM) $(INSTALL_BIN)/lfvutil
 
 # Dynamic library (to be loaded by Lua)
 lfv.so: lfvpic.o lfvluapic.o
